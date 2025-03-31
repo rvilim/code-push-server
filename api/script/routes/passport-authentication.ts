@@ -260,7 +260,7 @@ export class PassportAuthentication {
     );
 
     router.get(
-      "/auth/register/" + providerName, 
+      "/auth/register/" + providerName,
       limiter,
       this._cookieSessionMiddleware,
       (req: Request, res: Response, next: (err?: any) => void): any => {
@@ -295,7 +295,7 @@ export class PassportAuthentication {
         const action: string = req.session["action"];
         const hostname: string = req.session["hostname"];
         const user: passport.Profile = req.user;
-
+        console.log('action', action)
         if (action === "register" && !PassportAuthentication.isAccountRegistrationEnabled()) {
           restErrorUtils.sendForbiddenError(res);
           return;
@@ -397,6 +397,7 @@ export class PassportAuthentication {
                   );
                   return;
                 case "register":
+                  console.log('trying ot register')
                   const newUser: storage.Account = {
                     createdTime: new Date().getTime(),
                     email: emailAddress,
@@ -488,9 +489,8 @@ export class PassportAuthentication {
       redirectUrl: this.getCallbackUrl(providerName),
       clientID: microsoftClientId,
       clientSecret: microsoftClientSecret,
-      identityMetadata: `https://login.microsoftonline.com/${
-        process.env["MICROSOFT_TENANT_ID"] || "common"
-      }/v2.0/.well-known/openid-configuration`,
+      identityMetadata: `https://login.microsoftonline.com/${process.env["MICROSOFT_TENANT_ID"] || "common"
+        }/v2.0/.well-known/openid-configuration`,
       responseMode: "query",
       responseType: "code",
       scope: ["email", "profile"],
