@@ -270,8 +270,12 @@ export class PassportAuthentication {
         }
 
         req.session["action"] = "register";
-
+        console.log('register')
+        console.log('req', req)
+        console.log('------')
+        console.log(res)
         passport.authenticate(strategyName, { session: false })(req, res, next);
+        console.log('donedone')
       }
     );
 
