@@ -22,6 +22,7 @@
   },
   "author": "Microsoft",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.779.0",
     "@azure/data-tables": "^13.2.2",
     "@azure/identity": "^4.2.1",
     "@azure/keyvault-secrets": "^4.7.0",

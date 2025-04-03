@@ -19,6 +19,8 @@ import {
   CreateDeleteEntityAction,
 } from "@azure/data-tables";
 import { isPrototypePollutionKey } from "./storage";
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { createHash } from "crypto";
 
 module Keys {
   // Can these symbols break us?
@@ -161,16 +163,32 @@ interface AccessKeyPointer {
 export class AzureStorage implements storage.Storage {
   public static NO_ID_ERROR = "No id set";
 
-  private static HISTORY_BLOB_CONTAINER_NAME = "packagehistoryv1";
-  private static MAX_PACKAGE_HISTORY_LENGTH = 50;
+  private static HISTORY_BUCKET = process.env.CODEPUSH_HISTORY_BUCKET;
+  private static PACKAGE_BUCKET = process.env.CODEPUSH_PACKAGE_BUCKET;
   private static TABLE_NAME = "storagev2";
+
+  static MAX_PACKAGE_HISTORY_LENGTH = 50;
 
   private _tableClient: TableClient;
   private _blobService: BlobServiceClient;
+  private _s3Client: S3Client;
   private _setupPromise: q.Promise<void>;
 
   public constructor(accountName?: string, accountKey?: string) {
     shortid.characters("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-");
+
+    // Initialize S3 client for R2
+    this._s3Client = new S3Client({
+      region: process.env.S3_REGION || "auto",
+      endpoint: process.env.S3_ENDPOINT,
+      credentials: {
+        accessKeyId: process.env.S3_ACCESS_KEY_ID,
+        secretAccessKey: process.env.S3_SECRET_ACCESS_KEY
+      },
+      forcePathStyle: true,
+      // Use the correct configuration to disable request signing
+      signingRegion: "auto"
+    });
 
     this._setupPromise = this.setup(accountName, accountKey);
   }
@@ -200,7 +218,7 @@ export class AzureStorage implements storage.Storage {
           });
 
           const acquisitionBlobCheck: q.Promise<void> = this.blobHealthCheck(AzureStorage.TABLE_NAME);
-          const historyBlobCheck: q.Promise<void> = this.blobHealthCheck(AzureStorage.HISTORY_BLOB_CONTAINER_NAME);
+          const historyBlobCheck: q.Promise<void> = this.blobHealthCheck(AzureStorage.HISTORY_BUCKET);
 
           return q.all([tableCheck, acquisitionBlobCheck, historyBlobCheck]);
         })
@@ -692,33 +710,42 @@ export class AzureStorage implements storage.Storage {
   }
 
   public addBlob(blobId: string, stream: stream.Readable, streamLength: number): q.Promise<string> {
-    return this._setupPromise
-      .then(() => {
-        return utils.streamToBuffer(stream);
-      })
-      .then((buffer) => {
-        return this._blobService.getContainerClient(AzureStorage.TABLE_NAME).uploadBlockBlob(blobId, buffer, buffer.byteLength);
-      })
-      .then(() => {
-        return blobId;
-      })
-      .catch(AzureStorage.azureErrorHandler);
+    return q.Promise<string>((resolve, reject) => {
+      utils.streamToBuffer(stream)
+        .then(buffer => {
+          // Convert Buffer to Uint8Array for S3
+          const uint8Array = new Uint8Array(buffer);
+
+          return this._s3Client.send(new PutObjectCommand({
+            Bucket: AzureStorage.PACKAGE_BUCKET,
+            Key: blobId,
+            Body: uint8Array,
+            ContentType: 'application/x-gzip',
+            ACL: 'public-read'
+          }));
+        })
+        .then(() => resolve(blobId))
+        .catch(reject);
+    });
   }
 
   public getBlobUrl(blobId: string): q.Promise<string> {
-    return this._setupPromise
-      .then(() => {
-        return this._blobService.getContainerClient(AzureStorage.TABLE_NAME).getBlobClient(blobId).url;
-      })
-      .catch(AzureStorage.azureErrorHandler);
+    return q.Promise<string>((resolve) => {
+      // For R2, construct the URL using the endpoint
+      const url = `${process.env.S3_URL}/${blobId}`;
+      resolve(url);
+    });
   }
 
   public removeBlob(blobId: string): q.Promise<void> {
-    return this._setupPromise
-      .then(() => {
-        return this._blobService.getContainerClient(AzureStorage.TABLE_NAME).deleteBlob(blobId);
-      })
-      .catch(AzureStorage.azureErrorHandler);
+    return q.Promise<void>((resolve, reject) => {
+      this._s3Client.send(new DeleteObjectCommand({
+        Bucket: AzureStorage.PACKAGE_BUCKET,
+        Key: blobId
+      }))
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   public addAccessKey(accountId: string, accessKey: storage.AccessKey): q.Promise<string> {
@@ -898,14 +925,14 @@ export class AzureStorage implements storage.Storage {
       .all([
         tableServiceClient.createTable(AzureStorage.TABLE_NAME),
         blobServiceClient.createContainer(AzureStorage.TABLE_NAME, { access: "blob" }),
-        blobServiceClient.createContainer(AzureStorage.HISTORY_BLOB_CONTAINER_NAME),
+        blobServiceClient.createContainer(AzureStorage.HISTORY_BUCKET),
       ])
       .then(() => {
         return q.all<any>([
           tableClient.createEntity(tableHealthEntity),
           blobServiceClient.getContainerClient(AzureStorage.TABLE_NAME).uploadBlockBlob("health", "health", "health".length),
           blobServiceClient
-            .getContainerClient(AzureStorage.HISTORY_BLOB_CONTAINER_NAME)
+            .getContainerClient(AzureStorage.HISTORY_BUCKET)
             .uploadBlockBlob("health", "health", "health".length),
         ]);
       })
@@ -926,79 +953,64 @@ export class AzureStorage implements storage.Storage {
   }
 
   private blobHealthCheck(container: string): q.Promise<void> {
-    const deferred = q.defer<void>();
-
-    this._blobService
-      .getContainerClient(container)
-      .getBlobClient("health")
-      .downloadToBuffer()
-      .then((blobContents: Buffer) => {
-        if (blobContents.toString() !== "health") {
-          deferred.reject(
-            storage.storageError(
-              storage.ErrorCode.ConnectionFailed,
-              "The Azure Blobs service failed the health check for " + container
-            )
-          );
-        } else {
-          deferred.resolve();
-        }
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<void>((resolve, reject) => {
+      this._s3Client.send(new PutObjectCommand({
+        Bucket: container === AzureStorage.TABLE_NAME ? AzureStorage.PACKAGE_BUCKET : AzureStorage.HISTORY_BUCKET,
+        Key: 'health',
+        Body: new TextEncoder().encode('health'),
+        ContentLength: 'health'.length
+      }))
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private getPackageHistoryFromBlob(blobId: string): q.Promise<storage.Package[]> {
-    const deferred = q.defer<storage.Package[]>();
-
-    this._blobService
-      .getContainerClient(AzureStorage.HISTORY_BLOB_CONTAINER_NAME)
-      .getBlobClient(blobId)
-      .downloadToBuffer()
-      .then((blobContents: Buffer) => {
-        const parsedContents = JSON.parse(blobContents.toString());
-        deferred.resolve(parsedContents);
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<storage.Package[]>((resolve, reject) => {
+      this._s3Client.send(new GetObjectCommand({
+        Bucket: AzureStorage.HISTORY_BUCKET,
+        Key: blobId
+      }))
+        .then(async (response) => {
+          const streamData = await response.Body.transformToString();
+          resolve(JSON.parse(streamData));
+        })
+        .catch((error) => {
+          if (error.name === 'NoSuchKey') {
+            // If the history doesn't exist yet, return an empty array
+            resolve([]);
+          } else {
+            reject(error);
+          }
+        });
+    });
   }
 
   private uploadToHistoryBlob(blobId: string, content: string): q.Promise<void> {
-    const deferred = q.defer<void>();
+    return q.Promise<void>((resolve, reject) => {
+      const uint8Array = new TextEncoder().encode(content);
 
-    this._blobService
-      .getContainerClient(AzureStorage.HISTORY_BLOB_CONTAINER_NAME)
-      .uploadBlockBlob(blobId, content, content.length)
-      .then(() => {
-        deferred.resolve();
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+      this._s3Client.send(new PutObjectCommand({
+        Bucket: AzureStorage.HISTORY_BUCKET,
+        Key: blobId,
+        Body: uint8Array,
+        ContentType: 'application/json',
+        ACL: 'private'
+      }))
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private deleteHistoryBlob(blobId: string): q.Promise<void> {
-    const deferred = q.defer<void>();
-
-    this._blobService
-      .getContainerClient(AzureStorage.HISTORY_BLOB_CONTAINER_NAME)
-      .deleteBlob(blobId)
-      .then(() => {
-        deferred.resolve();
-      })
-      .catch((error: any) => {
-        deferred.reject(error);
-      });
-
-    return deferred.promise;
+    return q.Promise<void>((resolve, reject) => {
+      this._s3Client.send(new DeleteObjectCommand({
+        Bucket: AzureStorage.HISTORY_BUCKET,
+        Key: blobId
+      }))
+        .then(() => resolve())
+        .catch(reject);
+    });
   }
 
   private wrap(jsObject: any, partitionKey: string, rowKey: string): any {
@@ -1317,6 +1329,11 @@ export class AzureStorage implements storage.Storage {
     let errorCodeRaw: number | string;
     let errorMessage: string;
 
+    // Handle S3/R2 errors
+    if (azureError.name === 'NoSuchKey') {
+      throw storage.storageError(storage.ErrorCode.NotFound, "The specified key does not exist.");
+    }
+
     try {
       const parsedMessage = JSON.parse(azureError.message);
       errorCodeRaw = parsedMessage["odata.error"].code;
@@ -1331,7 +1348,6 @@ export class AzureStorage implements storage.Storage {
     }
 
     if (typeof errorCodeRaw === "number") {
-      // This is a storage.Error that we previously threw; just re-throw it
       throw azureError;
     }
 
@@ -1340,6 +1356,7 @@ export class AzureStorage implements storage.Storage {
       case "BlobNotFound":
       case "ResourceNotFound":
       case "TableNotFound":
+      case "NoSuchKey":
         errorCode = storage.ErrorCode.NotFound;
         break;
       case "EntityAlreadyExists":
@@ -1353,9 +1370,6 @@ export class AzureStorage implements storage.Storage {
       case "ETIMEDOUT":
       case "ESOCKETTIMEDOUT":
       case "ECONNRESET":
-        // This is an error emitted from the 'request' module, which is a
-        // dependency of 'azure-storage', and indicates failure after multiple
-        // retries.
         errorCode = storage.ErrorCode.ConnectionFailed;
         break;
       default:
